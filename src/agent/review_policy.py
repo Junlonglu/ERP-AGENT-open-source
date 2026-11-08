@@ -105,7 +105,10 @@ class ReviewPolicy:
     def chain(self):
         if self.model is None:
             raise RuntimeError("review router unavailable")
-        return self.model.with_structured_output(ReviewRoute)
+        # DeepSeek 不支持 response_format=json_schema：默认的 ProviderStrategy
+        # 会返回 400 "This response_format type is unavailable now"，导致每次
+        # 路由都降级。改用 function calling 拿到同样的结构化输出。
+        return self.model.with_structured_output(ReviewRoute, method="function_calling")
 
     def fallback(self, exc):
         agent_logger.warning(f"Review router fallback: {type(exc).__name__}")

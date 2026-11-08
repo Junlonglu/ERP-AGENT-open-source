@@ -32,16 +32,34 @@ def get_llm(*, thinking: bool = True, timeout: float | None = None,
     if timeout is not None:
         common_kwargs["timeout"] = timeout
     if thinking:
-        return ChatDeepSeek(
+        return _fix_structured_output_profile(ChatDeepSeek(
             **common_kwargs,
             reasoning_effort=LLM_REASONING_EFFORT,
             extra_body={"thinking": {"type": "enabled"}},
-        )
-    return ChatDeepSeek(
+        ))
+    return _fix_structured_output_profile(ChatDeepSeek(
         **common_kwargs,
         temperature=LLM_TEMPERATURE,
         extra_body={"thinking": {"type": "disabled"}},
-    )
+    ))
+
+
+def _fix_structured_output_profile(llm: ChatDeepSeek) -> ChatDeepSeek:
+    """修正模型档案里的 structured_output 能力标记。
+
+    langchain 的 ChatDeepSeek 档案声称支持 provider 原生结构化输出，但
+    DeepSeek 对话接口实际不支持 ``response_format=json_schema``，会返回
+    400 "This response_format type is unavailable now"（审查器 grader 因此
+    每次都失败）。把它改为 False，结构化输出会自动回退到 function calling。
+    """
+    try:
+        profile = dict(getattr(llm, "profile", None) or {})
+        if profile.get("structured_output"):
+            profile["structured_output"] = False
+            llm.profile = profile
+    except Exception:
+        pass
+    return llm
 
 
 # ============ MongoDB 配置 ============
