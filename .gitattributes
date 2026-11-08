@@ -1,0 +1,18 @@
+# 换行符统一：提交进仓库的一律 LF，避免 Windows/macOS 与 Linux CI 之间反复抖动
+* text=auto
+
+*.sh          text eol=lf
+*.yml         text eol=lf
+*.yaml        text eol=lf
+*.json        text eol=lf
+*.toml        text eol=lf
+Dockerfile    text eol=lf
+Makefile      text eol=lf
+
+# 二进制/生成物不要做行尾转换
+*.png         binary
+*.jpg         binary
+*.ico         binary
+*.woff        binary
+*.woff2       binary
+*.pyc         binary

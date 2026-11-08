@@ -1,0 +1,23 @@
+# 安装：.venv/Scripts/python.exe -m pip install pre-commit && .venv/Scripts/python.exe -m pre_commit install
+# 说明：ruff 只挂最小规则集（见 pyproject.toml），不做 ruff-format，
+#       避免一次性重排整个仓库、把真实改动淹没在格式化 diff 里。
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ["--maxkb=2048"]
+      - id: detect-private-key
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        args: ["--markdown-linebreak-ext=md"]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.4
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+        files: ^src/

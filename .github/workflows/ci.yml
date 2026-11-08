@@ -33,12 +33,12 @@ jobs:
           pip install pytest ruff
 
       - name: Lint (ruff)
-        run: ruff check src/
+        run: python scripts/dev.py lint
 
       - name: Unit tests (pytest)
         # 沙箱容器、MongoDB、真实模型都不在 CI 里，只跑离线可复现的用例。
         # 需要外部依赖的脚本已在 pyproject.toml 的 addopts 里排除。
-        run: pytest -q
+        run: python scripts/dev.py test
 
   frontend:
     name: Frontend (tsc + build)
@@ -60,7 +60,7 @@ jobs:
         run: npm ci
 
       - name: Type check
-        run: npx tsc --noEmit
+        run: npm run typecheck
 
       - name: Build
         run: npm run build
