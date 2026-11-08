@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -79,6 +80,7 @@ class ProgressiveSkillsTests(unittest.TestCase):
                 self.assertFalse(self.call("read_skill_resource", {"skill_id": self.id, "path": path})["success"])
         self.assertFalse(self.call("read_skill", {"skill_id": "builtin/../secret.md"})["success"])
 
+    @unittest.skipIf(sys.platform == "win32", "Windows 创建符号链接需要管理员权限")
     def test_symlink_outside_root(self):
         outside = self.root / "outside.txt"
         outside.write_text("SECRET")

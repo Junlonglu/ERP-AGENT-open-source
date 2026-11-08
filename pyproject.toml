@@ -1,0 +1,24 @@
+# 项目工具配置（CI 与本地共用同一份，避免两边口径不一致）
+
+[tool.pytest.ini_options]
+testpaths = ["src/test"]
+# 下面四个文件是手工联调脚本，不是 pytest 用例：
+# 它们需要真实 DeepSeek Key / 运行中的 MCP(:9000) / MongoDB，或在模块级直接执行。
+addopts = [
+    "--ignore=src/test/agent_test.py",
+    "--ignore=src/test/test_all_tools.py",
+    "--ignore=src/test/test_mcp.py",
+    "--ignore=src/test/test_memory_layer.py",
+]
+markers = [
+    "integration: 需要 Docker / MongoDB / 真实模型等外部依赖，CI 不跑",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+# 骨架阶段只拦“一定会出错”的问题：语法错误、未定义名称、调试残留。
+# 等存量代码清理后再逐步放开 E/W/I/UP 等规则，否则第一天就是 472 条报错。
+select = ["E9", "F63", "F7", "F82"]
