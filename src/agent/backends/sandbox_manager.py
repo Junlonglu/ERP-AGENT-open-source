@@ -37,6 +37,9 @@ from ..observability import measured
 # 沙箱状态枚举
 # ============================================================
 
+# 容器名统一前缀：预热池 erp-sandbox-warm-*，用户沙箱 erp-sandbox-<user>-*
+SANDBOX_CONTAINER_PREFIX = "erp-sandbox-"
+
 class SandboxState:
     WARM = "warm"           # 预热池中的空闲容器
     CLAIMED = "claimed"     # 已分配给用户
@@ -133,6 +136,7 @@ class SandboxManager:
         self._entries: Dict[str, SandboxEntry] = {}   # container_name → entry
         self._user_map: Dict[str, str] = {}           # user_id → container_name
         self._warm_creating = 0                        # 避免并发补池超量创建
+        self._orphans_reclaimed = False                # 启动时只扫一次遗留容器
 
         # --- 配置 ---
         self._warm_pool_size = (
@@ -157,6 +161,7 @@ class SandboxManager:
 
     def ensure_warm_pool(self):
         """确保预热池中有足够的空闲容器"""
+        self._reclaim_orphan_containers_once()
         with self._lock:
             warm_count = sum(
                 1 for e in self._entries.values()
@@ -184,6 +189,86 @@ class SandboxManager:
             finally:
                 with self._lock:
                     self._warm_creating = max(0, self._warm_creating - 1)
+
+    def _reclaim_orphan_containers_once(self):
+        """进程内只回收一次遗留容器。"""
+        with self._lock:
+            if self._orphans_reclaimed:
+                return
+            self._orphans_reclaimed = True
+        self._reclaim_orphan_containers()
+
+    def _cached_container_names(self) -> set:
+        """MongoDB 里登记过的容器名。
+
+        这些容器跨进程仍可通过 ``_restore_from_mongodb`` 恢复，不能当孤儿删掉。
+        """
+        from pymongo import MongoClient
+        import os
+
+        mongo_uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+        db_name = os.getenv("MONGODB_DB_NAME", "erp_agent")
+        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=3000)
+        try:
+            docs = client[db_name].sandbox_cache.find({}, {"container_name": 1})
+            return {d.get("container_name", "") for d in docs} - {""}
+        finally:
+            client.close()
+
+    def _reclaim_orphan_containers(self) -> int:
+        """回收上次进程遗留的沙箱容器。
+
+        容器登记表只在本进程内存（``self._entries``）里，后端重启后旧容器
+        无人认领，会一直占着内存和 CPU（历史上每次重启漏一个）。
+        启动时按容器名前缀扫一遍 Docker，既不在内存登记表、也没在 MongoDB
+        缓存里的容器视为孤儿并清掉；MongoDB 读不到时整步跳过，宁可漏清不可错删。
+        """
+        reclaimed = 0
+        try:
+            protected = self._cached_container_names()
+        except Exception as e:
+            sandbox_logger.warning(
+                f"Orphan sandbox reclamation skipped (MongoDB cache unavailable): {e}"
+            )
+            return 0
+        try:
+            import docker
+            client = docker.from_env()
+            try:
+                containers = client.containers.list(
+                    all=True, filters={"name": SANDBOX_CONTAINER_PREFIX}
+                )
+                with self._lock:
+                    known = set(self._entries.keys())
+                for container in containers:
+                    name = container.name or ""
+                    if (
+                        not name.startswith(SANDBOX_CONTAINER_PREFIX)
+                        or name in known
+                        or name in protected
+                    ):
+                        continue
+                    try:
+                        container.stop(timeout=2)
+                    except Exception:
+                        pass
+                    try:
+                        container.remove(force=True)
+                        reclaimed += 1
+                        sandbox_logger.info(f"Removed orphan sandbox container: {name}")
+                    except Exception as e:
+                        sandbox_logger.warning(
+                            f"Failed to remove orphan sandbox {name}: {e}"
+                        )
+            finally:
+                client.close()
+        except Exception as e:
+            sandbox_logger.warning(f"Orphan sandbox reclamation skipped: {e}")
+        if reclaimed:
+            sandbox_logger.info(
+                f"Reclaimed {reclaimed} orphan sandbox container(s) on startup"
+            )
+        return reclaimed
 
     def _create_warm_container(self) -> SandboxEntry:
         """创建一个预热容器"""

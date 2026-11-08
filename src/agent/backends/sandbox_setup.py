@@ -89,7 +89,7 @@ def create_secure_sandbox(config: SandboxConfig | None = None) -> CustomOpenSand
     seccomp_path = config.seccomp_path or _BUILTIN_SECCOMP
     seccomp_profile = None
     if config.use_seccomp and Path(seccomp_path).exists():
-        with open(seccomp_path, "r") as f:
+        with open(seccomp_path, "r", encoding="utf-8") as f:
             seccomp_profile = f.read()
 
     client = docker.from_env()
@@ -133,7 +133,13 @@ def create_secure_sandbox(config: SandboxConfig | None = None) -> CustomOpenSand
     # seccomp 安全策略
     security_opts = []
     if seccomp_profile:
-        security_opts.append(f"seccomp={seccomp_path}")
+        # Docker 守护进程运行在 WSL/Linux 中，看不到 Windows 宿主机路径，
+        # 会把 ``seccomp=D:\...`` 当作 JSON 内容解析并报
+        # "Decoding seccomp profile failed: invalid character 'D'"。
+        # 因此内联 JSON 内容，跨平台都能生效。
+        security_opts.append(
+            "seccomp=" + json.dumps(json.loads(seccomp_profile), separators=(",", ":"))
+        )
     security_opts.append("no-new-privileges:true")
     host_config_kwargs["security_opt"] = security_opts
 

@@ -9,6 +9,7 @@
     {
       "names": [
         "accept", "accept4", "access", "adjtimex", "alarm",
+        "arch_prctl", "ioctl",
         "bind", "brk",
         "capget", "capset", "chdir", "chmod", "chown", "chown32",
         "clock_getres", "clock_gettime", "clock_nanosleep", "clone",
@@ -185,8 +186,8 @@
     {
       "names": ["clone3"],
       "action": "SCMP_ACT_ERRNO",
-      "errnoRet": 1,
-      "comment": "Block clone3 entirely"
+      "errnoRet": 38,
+      "comment": "Block clone3 with ENOSYS so glibc falls back to clone"
     }
   ]
 }
