@@ -408,6 +408,15 @@ python scripts/dev.py install
 cd frontend && npm ci && cd ..
 ```
 
+Python 依赖分两层，与前端 `package.json` + `package-lock.json` 的分工对应：
+
+| 文件 | 角色 | 谁编辑 |
+|---|---|---|
+| `requirements.in`、`requirements-observability.in`、`requirements-dev.in` | 直接依赖，写下界 | 人手 |
+| `requirements.txt`、`requirements-observability.txt`、`requirements-dev.txt` | 全量锁定版本（含传递依赖） | `python scripts/dev.py lock` |
+
+改依赖只改 `.in`，然后跑 `python scripts/dev.py lock`——它会在 `python:3.11-slim` 容器里跑 pip-compile，与 CI 的 Linux 环境保持一致（在 Windows 上编译会把 pywin32 之类写进锁文件，Linux 装不上）。
+
 `scripts/dev.py` 是本仓库唯一的命令入口（替代 Makefile——Windows 上默认没有 `make`）。它内置 `PYTHONIOENCODING=utf-8` 与前端 `PORT=3000`，因此不需要再手工设置环境变量。
 
 ### 2. 配置 `.env`

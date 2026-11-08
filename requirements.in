@@ -1,0 +1,33 @@
+# 直接依赖（人手编辑的唯一来源）。
+#
+# 编译与安装：
+#   python scripts/dev.py lock     # 需要 Docker：在 python:3.11-slim 里编译，与 CI 环境一致
+#   python scripts/dev.py install  # 安装 requirements.txt 等已锁定的文件
+#
+# 不要在 requirements.txt 里手改版本：它是 pip-compile 的产物，下次 lock 会被覆盖。
+# 下界保留与原文件一致，只在确实需要抬高下限时才改这里。
+#
+# 已知差异：锁文件在 linux 容器内编译（对齐 CI），因此会多出 secretstorage、
+# jaraco-* 这类只在 Linux 上有用的纯 Python 包；在 Windows 上安装它们无害。
+# 反之，Windows 专属包不会被写进锁文件，这正是要在容器里编译的原因。
+
+deepagents>=0.7,<0.8
+langchain>=1.3.0
+langchain-openai>=1.3.0
+langgraph>=1.2.0
+langgraph-checkpoint-mongodb>=0.2.0
+langchain-mcp-adapters>=0.3.0
+fastmcp>=2.0.0
+fastapi>=0.115.0
+uvicorn>=0.30.0
+sse-starlette>=2.0.0
+motor>=3.5.0
+pymongo>=4.8.0
+httpx>=0.28.0
+python-dotenv>=1.0.0
+pyyaml>=6.0
+pydantic>=2.0.0
+matplotlib>=3.9.0
+pandas>=2.2.0
+docker>=7.0.0
+langchain-deepseek>=1.1.0

@@ -1,0 +1,5 @@
+# 可选的可观测性依赖（Langfuse）。
+# 业务代码在缺少它时必须继续运行：src/agent/observability.py 捕获 ImportError 后降级，
+# 但那样 Trace 会静默变成空壳，所以 CI 与本地开发都装上，保证这条路径真的被测到。
+
+langfuse==5.0.4

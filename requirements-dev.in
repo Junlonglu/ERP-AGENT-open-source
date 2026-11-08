@@ -1,0 +1,6 @@
+# 开发/CI 工具（不进入运行时镜像）。
+# 锁死版本是为了让 "本地 pytest 绿" 与 "CI pytest 绿" 指的是同一件事。
+
+pytest>=8.0
+ruff>=0.9
+pre-commit>=3.0

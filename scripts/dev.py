@@ -5,7 +5,8 @@
 一定存在（.venv），所以用一个脚本承担"唯一命令来源"，本地和 CI 调同一份。
 
 用法（在仓库根目录执行）：
-    .venv/Scripts/python.exe scripts/dev.py install    # 装后端依赖 + 测试/检查工具
+    .venv/Scripts/python.exe scripts/dev.py install    # 装锁定依赖 + 测试/检查工具
+    .venv/Scripts/python.exe scripts/dev.py lock       # 用 Docker 重新锁定依赖（pip-compile）
     .venv/Scripts/python.exe scripts/dev.py mcp        # 启动 MCP 服务 :9000
     .venv/Scripts/python.exe scripts/dev.py api        # 启动后端 API :8000
     .venv/Scripts/python.exe scripts/dev.py web        # 启动前端  :3000
@@ -50,7 +51,26 @@ def main(argv: list[str]) -> int:
             sys.executable, "-m", "pip", "install",
             "-r", "requirements.txt",
             "-r", "requirements-observability.txt",
-            "pytest", "ruff", "pre-commit",
+            "-r", "requirements-dev.txt",
+        ])
+
+    if task == "lock":
+        # 为什么要进 Docker：pip-compile 解析的是当前解释器与平台上可见的 wheel。
+        # 在 Windows 上编译会把 pywin32 之类写进锁文件，而 CI 是 ubuntu + py3.11；
+        # 在 python:3.11-slim 里编译才能得到与 CI 一致的依赖集。
+        return run([
+            "docker", "run", "--rm",
+            "-v", f"{ROOT.as_posix()}:/w", "-w", "/w",
+            "python:3.11-slim", "bash", "-lc",
+            "pip install -q pip-tools && "
+            + " && ".join(
+                f"pip-compile --strip-extras --quiet --output-file {out} {src}"
+                for src, out in (
+                    ("requirements.in", "requirements.txt"),
+                    ("requirements-observability.in", "requirements-observability.txt"),
+                    ("requirements-dev.in", "requirements-dev.txt"),
+                )
+            ),
         ])
 
     if task == "mcp":
