@@ -121,4 +121,8 @@ async def health():
 
 if __name__ == "__main__":
     import uvicorn
+
+    from src.agent.env_utils import ensure_utf8_stdio
+
+    ensure_utf8_stdio()
     uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -29,5 +29,8 @@ register_inventory_tools(mcp)
 
 
 if __name__ == "__main__":
+    from src.agent.env_utils import ensure_utf8_stdio
+
+    ensure_utf8_stdio()
     print(f"🚀 Starting MCP Server on {MCP_HOST}:{MCP_PORT} (SSE transport)")
     mcp.run(transport="sse", host=MCP_HOST, port=MCP_PORT)
