@@ -2,6 +2,8 @@
 
 > 基于 DeepAgent + LangGraph + MCP 协议的摩托车零部件采购智能助手，严格遵循 **Harness Engineering** 架构思想（Planning → Executing → Review → Result）。
 
+[![CI](https://github.com/Junlonglu/ERP-AGENT-open-source/actions/workflows/ci.yml/badge.svg)](https://github.com/Junlonglu/ERP-AGENT-open-source/actions/workflows/ci.yml)
+
 ---
 
 ## 项目简介
@@ -382,119 +384,133 @@ ERP-AGENT/
 
 ### 环境要求
 
-- Python 3.11+
-- Node.js 18+
-- MongoDB 6.0+
-- Docker Desktop（已启动）
-- DeepSeek API Key（对话、grader、联网搜索共用）
+| 组件 | 要求 | 是否必需 | 说明 |
+|---|---|---|---|
+| Python | 3.11+ | **必需** | 开发与 CI 均使用 3.11 |
+| Node.js | 18+ | **必需** | 前端 Next.js 16 实际要求 ≥ 20.9，CI 使用 22 LTS |
+| MongoDB | 6.0+ | **必需** | 会话检查点（MongoDBSaver）与长期记忆（MongoDBStore）的唯一存储，连不上直接抛错，不会降级 |
+| DeepSeek API Key | — | **必需** | 主对话、grader、审查路由共用 |
+| Docker Desktop | 已启动 | 可选 | 缺失时自动回退到 `LocalShellBackend(virtual_mode=True)`，代码执行隔离性下降 |
+| Java ERP 后端 | `ERP_BASE_URL` 可达 | 可选 | 不可用时基础对话与联网搜索仍可启动，仅 ERP 工具调用失败 |
 
-### 1. 克隆项目 & 安装依赖
+`.env` 中真正需要你填的只有 `DEEPSEEK_API_KEY` 一项（`MONGODB_URI` 默认就是 `mongodb://localhost:27017`，只有换地址时才需要改），其余在 `.env.example` 里都有可用默认值。缺少 `.env` 文件时启动会打印 `[warn] .env file not found at ...` 并继续。
+
+### 1. 克隆并安装依赖
 
 ```bash
-# 克隆项目
 git clone <repo-url>
-cd ERP-AGENT
+cd ERP-AGENT-open-source
 
-# Python 依赖
-pip install -r requirements.txt
+# 后端依赖 + 测试/检查工具（pytest、ruff、pre-commit）一次装好
+python scripts/dev.py install
 
 # 前端依赖
-cd frontend
-npm install
-cd ..
+cd frontend && npm ci && cd ..
 ```
 
-### 2. 配置环境变量
+`scripts/dev.py` 是本仓库唯一的命令入口（替代 Makefile——Windows 上默认没有 `make`）。它内置 `PYTHONIOENCODING=utf-8` 与前端 `PORT=3000`，因此不需要再手工设置环境变量。
 
-编辑项目根目录 `.env` 文件：
+### 2. 配置 `.env`
 
 ```bash
-# DeepSeek API Key（主对话、grader、联网搜索共用）
+cp .env.example .env      # Windows: copy .env.example .env
+```
+
+最小可用配置：
+
+```dotenv
 DEEPSEEK_API_KEY=sk-your-api-key
 LLM_MODEL=deepseek-flash
 LLM_BASE_URL=https://api.deepseek.com
-WEB_SEARCH_MODEL=deepseek-flash
-DEEPSEEK_RESPONSES_URL=https://api.deepseek.com/responses
-
-# MongoDB 连接
 MONGODB_URI=mongodb://localhost:27017
-
-# Java ERP 后端地址
-# 若没有自己的 ERP 服务，可先保留占位地址，联网搜索和基础对话仍可启动
 ERP_BASE_URL=http://localhost:8081
-
-# MCP Server 地址（本地）
 MCP_SERVER_URL=http://localhost:9000
-
-# 沙箱 Docker 镜像
-SANDBOX_IMAGE=python:3.11-slim
 ```
 
-### 3. 启动 MongoDB
+### 3. 启动 MongoDB（必需）
 
 ```bash
-# 确保 MongoDB 正在运行
-mongod --dbpath /path/to/data
-
-# 或使用 Docker
-docker run -d --name mongodb -p 27017:27017 mongo:6.0
+docker run -d --name erp-mongodb -p 27017:27017 mongo:6.0
+# 或使用已有的 mongod 实例，改 MONGODB_URI 即可
 ```
 
-### 4. 启动 Docker 沙箱容器
+### 4. 准备 Docker 沙箱镜像（可选，无需手工建容器）
+
+沙箱容器由后端在启动时自动创建（预热池 + 按需认领，容器名形如 `erp-sandbox-warm-<hash>`），**不需要**手工 `docker run`。只需预先拉取镜像：
 
 ```bash
-docker run -d \
-  --name erp-sandbox \
-  -w /workspace \
-  python:3.11-slim \
-  sleep infinity
+docker pull python:3.11-slim
 ```
 
-### 5. 启动 MCP Server（端口 9000）
+沙箱启用 7 层加固：只读根文件系统、tmpfs、资源限制、网络隔离、capability 移除、seccomp 白名单、PID 限制。自定义 seccomp 配置创建失败时会回退到基础沙箱，日志中会出现 seccomp 相关告警——这表示该轮隔离等级下降，不等于安全验收通过。
+
+### 5. 启动服务
+
+三个服务各占一个终端：
+
+```bash
+python scripts/dev.py mcp     # MCP Server   :9000
+python scripts/dev.py api     # 后端 API     :8000
+python scripts/dev.py web     # 前端         :3000
+```
+
+等价的手工命令：
 
 ```bash
 python -m src.mcp_server.server_main
-```
-
-看到以下输出表示成功：
-```
-🚀 Starting MCP Server on 0.0.0.0:9000 (SSE transport)
-Uvicorn running on http://0.0.0.0:9000
-```
-
-### 6. 启动后端 API（端口 8000）
-
-```bash
 python -m src.api_view.web_main
+cd frontend && npm run dev
 ```
 
-看到以下输出表示成功：
-```
+启动成功的标志：
+
+```text
+# MCP Server
+🚀 Starting MCP Server on 0.0.0.0:9000 (SSE transport)
+# 后端 API
 AgentLoader initialized
-Starting ERP Agent Web Server...
 Uvicorn running on http://0.0.0.0:8000
+# 前端
+▲ Next.js 16.2.12  - Local: http://localhost:3000
 ```
 
-### 7. 启动前端（端口 3000）
+### 6. 访问与自检
+
+浏览器打开 http://localhost:3000
 
 ```bash
-cd frontend
-npm run dev
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:3000/            # 200
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/api/history  # 200
 ```
 
-### 8. 访问应用
+### 常见问题
 
-浏览器打开 http://localhost:3000 即可使用。
+**前端端口不是 3000**：Next.js 会读取环境变量 `PORT`，被 shell 里已有的值覆盖（例如 `PORT=8787`）。用 `python scripts/dev.py web` 启动会强制使用 3000。
+
+**启动报 `UnicodeEncodeError: 'gbk' codec can't encode character`**：`src/agent/env_utils.py` 的 `ensure_utf8_stdio()` 已统一处理（stdio 切 UTF-8，并把 Windows 控制台代码页设为 65001），无需再手工设置 `PYTHONIOENCODING`。若分支较旧没有该函数，启动前设置 `PYTHONIOENCODING=utf-8` 即可。
+
+**后端启动了但工具数量不对**：MCP Server 未就绪时，Agent 会重试 3 次后以空工具列表继续启动（日志有告警）。MCP 起来后重启后端即可重新加载 23 个 ERP 工具。
+
+**前端报 `Module not found: Can't resolve 'next/dist/...'`**：`node_modules` 完整性被破坏（多为并发执行 `npm install` 导致）。删掉 `frontend/node_modules` 后重新 `npm ci`。
+
+### 提交前校验
+
+```bash
+pre-commit install                              # 每个克隆只需一次
+python scripts/dev.py check                    # ruff + pytest
+```
+
+CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑同样的检查：后端取 `src/test` 的离线子集（`agent_test.py`、`test_all_tools.py`、`test_mcp.py`、`test_memory_layer.py` 是需要真实 MCP / API Key 的手工联调脚本，已排除在自动收集之外），前端跑 `tsc --noEmit` 与 `next build`。
 
 ---
 
 ## 启动顺序总结
 
-```
-MongoDB → Docker沙箱 → MCP Server(:9000) → Backend API(:8000) → Frontend(:3000)
+```text
+MongoDB → (Docker 镜像) → MCP Server(:9000) → Backend API(:8000) → Frontend(:3000)
 ```
 
-> 注意：MCP Server 必须在 Backend API 之前启动，因为 Agent 初始化时会连接 MCP Server 加载 23 个 ERP 工具。
+> MCP Server 必须先于 Backend API 启动，否则 Agent 初始化时拿不到 23 个 ERP 工具。
 
 ---
 
