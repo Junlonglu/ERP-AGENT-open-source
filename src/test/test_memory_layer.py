@@ -1,7 +1,11 @@
 """三层记忆（HOT/WARM/COLD）的验证测试。
 
 设计原则：**不依赖 MongoDB、Docker、DeepSeek、langchain**，用内存假 Store 跑，
-所以 `python -m src.test.test_memory_layer` 在任何 Python 3.10+ 上都能跑通。
+所以 `pytest src/test/test_memory_layer.py` 在任何 Python 3.10+ 上都能跑通
+（也可用 `python -m src.test.test_memory_layer` 跑自带入口）。
+
+注意：下面的 `@case` 装饰器只用于脚本入口收集用例。曾经它叫 `@test`，会被 pytest
+当成名为 test 的用例函数，报 `fixture 'func' not found`。
 
 覆盖：
 - P0 修复：偏好合并不再丢字段、提取维度补全
@@ -38,7 +42,7 @@ from src.agent.memory.extractor import extract_preferences, summarize_episode
 _RESULTS: List[tuple] = []
 
 
-def test(func):
+def case(func):
     _RESULTS.append(func)
     return func
 
@@ -116,7 +120,7 @@ def _cfg(**overrides) -> MemoryConfig:
 
 # ---------------------------------------------------------------- P0 修复
 
-@test
+@case
 def test_preferences_merge_keeps_previous_fields():
     """P0-1：旧实现整键覆盖，第二次写入会清掉第一次的字段。"""
     store = FakeStore()
@@ -138,7 +142,7 @@ def test_preferences_merge_keeps_previous_fields():
     }, "旧行为复现失败，说明测试没有真正覆盖该 Bug"
 
 
-@test
+@case
 def test_preferences_merge_list_union_with_cap():
     store = FakeStore()
     keeper = MemoryKeeper(store, "u1", _cfg(max_recent_suppliers=3))
@@ -152,7 +156,7 @@ def test_preferences_merge_list_union_with_cap():
     assert len(suppliers) <= 3, suppliers
 
 
-@test
+@case
 def test_extract_chart_and_output_preferences():
     """P0-2：祈使语境下的偏好也能抽出来，不再要求"以后/默认/总是"。"""
     messages = [
@@ -165,7 +169,7 @@ def test_extract_chart_and_output_preferences():
     assert updates.get("preferred_output") == "table", updates
 
 
-@test
+@case
 def test_extract_recent_suppliers_from_tool_calls():
     """P0-2：README 写了但原来没实现的 recent_suppliers / recent_queries。"""
     messages = [
@@ -180,7 +184,7 @@ def test_extract_recent_suppliers_from_tool_calls():
     assert updates.get("recent_queries"), updates
 
 
-@test
+@case
 def test_extract_supplier_fallback_regex():
     """正则兜底：要能剥掉"这两家"这类指示词，不能抽出一长串废话。"""
     messages = [Msg("human", "对比一下春风动力和钱江摩托这两家供应商")]
@@ -192,7 +196,7 @@ def test_extract_supplier_fallback_regex():
 
 # ---------------------------------------------------------------- 命名空间
 
-@test
+@case
 def test_namespace_normalization():
     assert semantic_ns("alice") == ("memories", "alice", "semantic")
     assert episodic_ns("alice") == ("memories", "alice", "episodic")
@@ -205,7 +209,7 @@ def test_namespace_normalization():
     assert ns.user_of(semantic_ns("alice")) == "alice"
 
 
-@test
+@case
 def test_items_land_in_normalized_namespaces():
     store = FakeStore()
     keeper = MemoryKeeper(store, "alice")
@@ -217,7 +221,7 @@ def test_items_land_in_normalized_namespaces():
     assert ("user-preferences", "alice") in {k[0] for k in store.data} or True
 
 
-@test
+@case
 def test_user_isolation_by_namespace():
     store = FakeStore()
     MemoryKeeper(store, "alice").upsert_semantic("preferred_chart_type", "pie")
@@ -229,7 +233,7 @@ def test_user_isolation_by_namespace():
 
 # ---------------------------------------------------------------- 冲突消解
 
-@test
+@case
 def test_semantic_conflict_invalidates_old_value():
     """用户改口：旧值标记失效沉入 COLD，新值成为唯一有效版本。"""
     store = FakeStore()
@@ -249,7 +253,7 @@ def test_semantic_conflict_invalidates_old_value():
     assert invalidated[0].supersedes == active.id, "旧值应指向取代它的新值"
 
 
-@test
+@case
 def test_upsert_same_value_does_not_create_new_version():
     store = FakeStore()
     keeper = MemoryKeeper(store, "u1")
@@ -258,7 +262,7 @@ def test_upsert_same_value_does_not_create_new_version():
     assert len(keeper.semantic_history("preferred_output")) == 1
 
 
-@test
+@case
 def test_warm_brief_excludes_invalidated():
     store = FakeStore()
     keeper = MemoryKeeper(store, "u1")
@@ -273,7 +277,7 @@ def test_warm_brief_excludes_invalidated():
 
 # ---------------------------------------------------------------- 分层归属
 
-@test
+@case
 def test_tier_classification_and_demotion():
     cfg = _cfg(warm_episode_days=7)
     fresh = MemoryItem(id="e1", type="episodic", content="x", created_at=_iso(1))
@@ -290,7 +294,7 @@ def test_tier_classification_and_demotion():
     assert semantic.tier(cfg.warm_episode_days) == "cold"
 
 
-@test
+@case
 def test_old_episodes_demote_out_of_warm():
     store = FakeStore()
     keeper = MemoryKeeper(store, "u1", _cfg(warm_episode_days=7))
@@ -315,7 +319,7 @@ def test_old_episodes_demote_out_of_warm():
 
 # ---------------------------------------------------------------- 情节归档
 
-@test
+@case
 def test_episode_archive_is_idempotent():
     store = FakeStore()
     keeper = MemoryKeeper(store, "u1")
@@ -328,7 +332,7 @@ def test_episode_archive_is_idempotent():
     assert episodes[0].id == "ep_t-1"
 
 
-@test
+@case
 def test_episode_summary_shape():
     messages = [
         Msg("human", "查询恒力机械的信用和供货能力"),
@@ -343,7 +347,7 @@ def test_episode_summary_shape():
 
 # ---------------------------------------------------------------- 遗忘
 
-@test
+@case
 def test_forget_removes_expired_items():
     store = FakeStore()
     keeper = MemoryKeeper(store, "u1", _cfg(episode_ttl_days=30))
@@ -362,7 +366,7 @@ def test_forget_removes_expired_items():
     assert keeper.get("episodic", "ep_t-new") is not None
 
 
-@test
+@case
 def test_forget_enforces_episode_cap():
     store = FakeStore()
     keeper = MemoryKeeper(store, "u1", _cfg(max_episodes=3))
@@ -377,7 +381,7 @@ def test_forget_enforces_episode_cap():
     assert len(keeper.list_items("episodic")) == 3
 
 
-@test
+@case
 def test_forget_is_throttled_across_instances():
     """回归：中间件每轮都 new MemoryKeeper，实例级节流会失效；必须跨实例共享。"""
     from src.agent.memory.keeper import _LAST_SWEEP, reset_sweep_state
@@ -402,7 +406,7 @@ def test_forget_is_throttled_across_instances():
     assert store.calls["search"] > searches_after_first
 
 
-@test
+@case
 def test_forget_prunes_semantic_history():
     store = FakeStore()
     keeper = MemoryKeeper(store, "u1", _cfg(max_semantic_history=2))
@@ -417,7 +421,7 @@ def test_forget_prunes_semantic_history():
 
 # ---------------------------------------------------------------- 检索
 
-@test
+@case
 def test_search_ranks_by_relevance():
     store = FakeStore()
     keeper = MemoryKeeper(store, "u1")
@@ -430,7 +434,7 @@ def test_search_ranks_by_relevance():
     assert "供应商" in hits[0][0].summary, hits[0][0].summary
 
 
-@test
+@case
 def test_search_ignores_irrelevant_memories():
     store = FakeStore()
     keeper = MemoryKeeper(store, "u1")
@@ -439,7 +443,7 @@ def test_search_ignores_irrelevant_memories():
     assert keeper.search("供应商信用评级") == [], "完全不相关的记忆不应被召回"
 
 
-@test
+@case
 def test_search_touches_access_count():
     store = FakeStore()
     keeper = MemoryKeeper(store, "u1")
@@ -450,7 +454,7 @@ def test_search_touches_access_count():
     assert item.access_count >= 1, item.access_count
 
 
-@test
+@case
 def test_search_text_is_human_readable():
     store = FakeStore()
     keeper = MemoryKeeper(store, "u1")
@@ -460,7 +464,7 @@ def test_search_text_is_human_readable():
     assert "相关度" in text
 
 
-@test
+@case
 def test_bm25_and_tokenizer():
     tokens = scoring.tokenize("对比供应商SupplierA")
     # 中文按字 + 二元组切分，所以出现的是"供应"/"应商"而不是"供应商"三字串
@@ -473,7 +477,7 @@ def test_bm25_and_tokenizer():
 
 # ---------------------------------------------------------------- 容错 / 迁移
 
-@test
+@case
 def test_keeper_survives_store_failure():
     keeper = MemoryKeeper(FakeStore(fail=True), "u1")
     assert keeper.available is True  # 实例可用，只是写入失败
@@ -488,7 +492,7 @@ def test_keeper_survives_store_failure():
     assert keeper.list_items("episodic") == []
 
 
-@test
+@case
 def test_keeper_without_store_is_noop():
     keeper = MemoryKeeper(None, "u1")
     assert keeper.available is False
@@ -496,7 +500,7 @@ def test_keeper_without_store_is_noop():
     assert keeper.search("x") == []
 
 
-@test
+@case
 def test_legacy_migration_is_idempotent():
     store = FakeStore()
     store.put(("user-preferences", "u1"), "preferences", {"preferred_chart_type": "pie"})
@@ -508,7 +512,7 @@ def test_legacy_migration_is_idempotent():
     assert keeper.migrate_legacy_preferences() == 0
 
 
-@test
+@case
 def test_migration_not_blocked_by_unrelated_semantic():
     """回归：semantic 下存在与偏好无关的条目时，迁移不应被整体跳过。"""
     store = FakeStore()
@@ -524,7 +528,7 @@ def test_migration_not_blocked_by_unrelated_semantic():
     assert keeper.migrate_legacy_preferences() == 0
 
 
-@test
+@case
 def test_part_args_do_not_leak_into_suppliers():
     """回归：part_search 的参数不应混进 recent_suppliers。"""
     messages = [
@@ -540,7 +544,7 @@ def test_part_args_do_not_leak_into_suppliers():
     assert "刹车片" not in suppliers, updates
 
 
-@test
+@case
 def test_consolidate_end_to_end():
     store = FakeStore()
     keeper = MemoryKeeper(store, "u1")
@@ -557,7 +561,7 @@ def test_consolidate_end_to_end():
     assert result["episode"] is not None
 
 
-@test
+@case
 def test_stats_reports_tier_distribution():
     store = FakeStore()
     keeper = MemoryKeeper(store, "u1", _cfg(warm_episode_days=7))
@@ -570,7 +574,7 @@ def test_stats_reports_tier_distribution():
 
 # ---------------------------------------------------------------- 集成（缺依赖则跳过）
 
-@test
+@case
 def test_subagent_tool_matching():
     try:
         from langchain_core.tools import BaseTool
@@ -607,7 +611,7 @@ def test_subagent_tool_matching():
     assert "supplier_query" not in matched, matched
 
 
-@test
+@case
 def test_middleware_smoke():
     try:
         from langchain.agents.middleware import AgentMiddleware  # noqa: F401
@@ -645,7 +649,7 @@ def test_middleware_smoke():
     assert MemoryConsolidationMiddleware(store=broken, user_id="u1").after_agent(state, FakeRuntime()) is None
 
 
-@test
+@case
 def test_middleware_handles_empty_and_broken_state():
     try:
         from langchain.agents.middleware import AgentMiddleware  # noqa: F401

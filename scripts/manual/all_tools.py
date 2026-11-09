@@ -2,17 +2,20 @@
 全部工具单元测试
 逐个验证每个自定义工具的基本功能
 """
+
+# 手工联调脚本：需要真实 MCP / DeepSeek Key / ERP 后端，不进 CI，也不被 pytest 收集。
 import asyncio
 import sys
 import os
+from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from agent.env_utils import load_env
+from agent.env_utils import ensure_utf8_stdio, load_env
 load_env()
 
 
-async def test_chart_generator():
+async def check_chart_generator():
     """测试图表生成工具"""
     print("[1] 测试 chart_generator...")
     from agent.tools.chart_generator import generate_chart
@@ -28,7 +31,7 @@ async def test_chart_generator():
     print("    ✓ chart_generator 正常\n")
 
 
-async def test_web_search():
+async def check_web_search():
     """测试Web搜索工具"""
     print("[2] 测试 web_search...")
     from agent.tools.web_search import web_search
@@ -40,7 +43,7 @@ async def test_web_search():
     print("    ✓ web_search 正常\n")
 
 
-async def test_mcp_tools():
+async def check_mcp_tools():
     """测试MCP工具加载"""
     print("[3] 测试 MCP 工具加载...")
     from agent.tools.mcp_client import load_mcp_tools_sync
@@ -55,7 +58,7 @@ async def test_mcp_tools():
         print(f"    ⚠ MCP工具加载失败(需先启动MCP Server): {e}\n")
 
 
-async def test_subagent_loader():
+async def check_subagent_loader():
     """测试子Agent配置加载"""
     print("[4] 测试子Agent配置加载...")
     from agent.subagents.loader import load_subagent_configs
@@ -67,7 +70,7 @@ async def test_subagent_loader():
     print("    ✓ 子Agent配置加载正常\n")
 
 
-async def test_schema():
+async def check_schema():
     """测试数据模型"""
     print("[5] 测试数据模型...")
     from agent.schema import ProcurementContext, ChatRequest
@@ -94,20 +97,20 @@ async def main():
     print("  工具单元测试")
     print("=" * 50 + "\n")
 
-    await test_schema()
-    await test_subagent_loader()
+    await check_schema()
+    await check_subagent_loader()
 
     try:
-        await test_chart_generator()
+        await check_chart_generator()
     except Exception as e:
         print(f"    ⚠ chart_generator 测试跳过: {e}\n")
 
     try:
-        await test_web_search()
+        await check_web_search()
     except Exception as e:
         print(f"    ⚠ web_search 测试跳过: {e}\n")
 
-    await test_mcp_tools()
+    await check_mcp_tools()
 
     print("=" * 50)
     print("  测试完成")
@@ -115,4 +118,5 @@ async def main():
 
 
 if __name__ == "__main__":
+    ensure_utf8_stdio()
     asyncio.run(main())

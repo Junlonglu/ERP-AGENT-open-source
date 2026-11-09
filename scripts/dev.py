@@ -84,13 +84,13 @@ def main(argv: list[str]) -> int:
         return run([NPM, "run", "dev"], cwd=FRONTEND, env={"PORT": "3000"})
 
     if task == "lint":
-        return run([sys.executable, "-m", "ruff", "check", "src/"])
+        return run([sys.executable, "-m", "ruff", "check", "src/", "scripts/"])
 
     if task == "test":
         return run([sys.executable, "-m", "pytest", "-q", *args])
 
     if task == "check":
-        code = run([sys.executable, "-m", "ruff", "check", "src/"])
+        code = run([sys.executable, "-m", "ruff", "check", "src/", "scripts/"])
         return code or run([sys.executable, "-m", "pytest", "-q", *args])
 
     if task == "typecheck":

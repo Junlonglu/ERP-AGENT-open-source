@@ -313,7 +313,7 @@ python -m unittest src.test.test_hybrid_review -v
 ### 验证
 
 ```bash
-python -m src.test.test_memory_layer
+python scripts/dev.py test src/test/test_memory_layer.py
 python -m unittest src.test.test_memory_integration -v
 ```
 
@@ -509,7 +509,7 @@ pre-commit install                              # 每个克隆只需一次
 python scripts/dev.py check                    # ruff + pytest
 ```
 
-CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑同样的检查：后端取 `src/test` 的离线子集（`agent_test.py`、`test_all_tools.py`、`test_mcp.py`、`test_memory_layer.py` 是需要真实 MCP / API Key 的手工联调脚本，已排除在自动收集之外），前端跑 `tsc --noEmit` 与 `next build`。
+CI（`.github/workflows/ci.yml`）在每次 push / PR 上跑同样的检查：后端用 `pytest` 跑 `src/test` 全部离线用例（需要 Docker / MongoDB / 真实模型的用例打 `integration` 标记后排除；需要真实 MCP 与 API Key 的手工联调脚本放在 `scripts/manual/`，不在 pytest 收集范围内），前端跑 `tsc --noEmit` 与 `next build`。
 
 ---
 

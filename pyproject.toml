@@ -2,14 +2,8 @@
 
 [tool.pytest.ini_options]
 testpaths = ["src/test"]
-# 下面四个文件是手工联调脚本，不是 pytest 用例：
-# 它们需要真实 DeepSeek Key / 运行中的 MCP(:9000) / MongoDB，或在模块级直接执行。
-addopts = [
-    "--ignore=src/test/agent_test.py",
-    "--ignore=src/test/test_all_tools.py",
-    "--ignore=src/test/test_mcp.py",
-    "--ignore=src/test/test_memory_layer.py",
-]
+# 手工联调脚本（需真实 MCP / DeepSeek Key / ERP 后端）放在 scripts/manual/，不在
+# testpaths 里，因而不需要逐个 --ignore：新增同类脚本默认不会被收集。
 markers = [
     "integration: 需要 Docker / MongoDB / 真实模型等外部依赖，CI 不跑",
 ]

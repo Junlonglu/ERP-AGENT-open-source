@@ -2,17 +2,20 @@
 端到端 Agent 测试
 模拟完整对话流程，验证 Agent 核心功能
 """
+
+# 手工联调脚本：需要真实 MCP / DeepSeek Key / ERP 后端，不进 CI，也不被 pytest 收集。
 import asyncio
 import sys
 import os
+from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from agent.env_utils import load_env
+from agent.env_utils import ensure_utf8_stdio, load_env
 load_env()
 
 
-async def test_agent_creation():
+async def check_agent_creation():
     """测试 Agent 创建"""
     print("[1] 测试 Agent 创建...")
     from agent.schema import ProcurementContext
@@ -30,7 +33,7 @@ async def test_agent_creation():
     return agent
 
 
-async def test_simple_query(agent):
+async def check_simple_query(agent):
     """测试简单查询"""
     print("[2] 测试简单查询: '你好，请介绍一下你的功能'")
     config = {"configurable": {"thread_id": "test-e2e-001"}}
@@ -50,7 +53,7 @@ async def test_simple_query(agent):
         print(f"    ⚠ 查询失败: {e}\n")
 
 
-async def test_supplier_query(agent):
+async def check_supplier_query(agent):
     """测试供应商查询"""
     print("[3] 测试供应商查询: '查询所有供应商'")
     config = {"configurable": {"thread_id": "test-e2e-002"}}
@@ -70,7 +73,7 @@ async def test_supplier_query(agent):
         print(f"    ⚠ 查询失败: {e}\n")
 
 
-async def test_inventory_warning(agent):
+async def check_inventory_warning(agent):
     """测试库存预警"""
     print("[4] 测试库存预警: '查看库存预警'")
     config = {"configurable": {"thread_id": "test-e2e-003"}}
@@ -98,15 +101,15 @@ async def main():
     print("=" * 60 + "\n")
 
     try:
-        agent = await test_agent_creation()
+        agent = await check_agent_creation()
     except Exception as e:
         print(f"✗ Agent 创建失败: {e}")
         print("  请检查: 1) MCP Server是否启动  2) 依赖是否安装")
         return
 
-    await test_simple_query(agent)
-    await test_supplier_query(agent)
-    await test_inventory_warning(agent)
+    await check_simple_query(agent)
+    await check_supplier_query(agent)
+    await check_inventory_warning(agent)
 
     print("=" * 60)
     print("  端到端测试完成")
@@ -114,4 +117,5 @@ async def main():
 
 
 if __name__ == "__main__":
+    ensure_utf8_stdio()
     asyncio.run(main())
