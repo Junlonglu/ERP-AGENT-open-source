@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from pydantic import Field
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -53,6 +53,22 @@ class ProgressiveSkillsTests(unittest.TestCase):
     def put(self, user="alice", key="my-skill/SKILL.md", text=None):
         text = text or "---\nname: private\ndescription: user description\n---\nPRIVATE_BODY"
         self.store.put(("persisted-skills", user), key, {"encoding": "base64", "content": base64.b64encode(text.encode()).decode()})
+
+    def test_pagination_error_keeps_the_reason(self):
+        # 模型曾把 "Skill read unavailable (ValueError)" 当成技能坏了，
+        # 连调 10 次 list_skills 换关键词；真实原因是 limit 越界。
+        result = self.call("list_skills", {"limit": 99})
+
+        self.assertFalse(result["success"])
+        self.assertIn("Invalid pagination", result["error"])
+
+    def test_storage_errors_stay_generic(self):
+        with patch.object(SkillCatalog, "entries", side_effect=RuntimeError("mongo://user:pw@host")):
+            result = self.call("list_skills", {})
+
+        self.assertFalse(result["success"])
+        self.assertNotIn("mongo://", result["error"])
+        self.assertIn("check ID, path and file limits", result["error"])
 
     def test_index_is_metadata_only(self):
         self.assertIn("Compare quotes", self.catalog.index())

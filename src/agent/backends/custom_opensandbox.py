@@ -18,6 +18,15 @@ from deepagents.backends import DEFAULT_EXECUTE_TIMEOUT
 from ..log_utils import sandbox_logger
 from ..config import SANDBOX_WORK_DIR
 
+# Docker 的 put_archive 在 --read-only 容器上一律返回 400（连 tmpfs 目标也拒绝），
+# 遇到这种情况改为 exec 分块传 base64 再解包。单条命令长度受容器 ARG_MAX（约 2MB）限制。
+_UPLOAD_CHUNK_CHARS = 48_000
+
+
+def _is_read_only_refusal(exc: BaseException) -> bool:
+    """判断 put_archive 是否因只读根文件系统被拒绝。"""
+    return "read-only" in str(exc).lower()
+
 
 class CustomOpenSandbox(BaseSandbox):
     """
@@ -369,8 +378,38 @@ class CustomOpenSandbox(BaseSandbox):
         except Exception as e:
             return f"Download failed: {e}"
 
+    def _extract_via_exec(self, remote_dir: str, payload: bytes) -> None:
+        """Fallback upload for read-only rootfs containers.
+
+        Docker rejects ``put_archive`` whenever the container rootfs is read-only --
+        for *every* path, including tmpfs mounts -- so ``--read-only`` and put_archive
+        are mutually exclusive. Instead of weakening the container, stream the tar in
+        as base64 chunks and unpack it with the container's own shell.
+
+        Each chunk is its own ``docker exec``: the kernel caps a *single* argv element
+        at MAX_ARG_STRLEN (128 KiB), so concatenating the chunks into one command
+        fails with ``argument list too long`` for anything past ~90 KB of tar.gz
+        (measured: the project archive is ~515 KB compressed).
+        """
+        encoded = base64.b64encode(payload).decode("ascii")
+        remote_b64 = "/tmp/.erp-upload.b64"
+        steps = [f"mkdir -p '{remote_dir}'", f"rm -f {remote_b64}"]
+        for start in range(0, len(encoded), _UPLOAD_CHUNK_CHARS):
+            steps.append(f"printf '%s' '{encoded[start:start + _UPLOAD_CHUNK_CHARS]}' >> {remote_b64}")
+        steps.append(f"base64 -d {remote_b64} | tar -x -C '{remote_dir}' && rm -f {remote_b64}")
+        for index, step in enumerate(steps):
+            response = self.execute(step, timeout=60)
+            if response.exit_code != 0:
+                output = response.output or b""
+                if isinstance(output, bytes):
+                    output = output.decode("utf-8", "replace")
+                raise RuntimeError(
+                    f"exec upload failed at step {index + 1}/{len(steps)} "
+                    f"(exit {response.exit_code}): {output[:200]}"
+                )
+
     def upload_files(self, files: list[tuple[str, bytes]]) -> list[FileUploadResponse]:
-        """上传文件到容器（tar 流方式）"""
+        """上传文件到容器（tar 流方式；只读根文件系统时走 exec 兜底）"""
         results = []
         for path, content in files:
             try:
@@ -383,8 +422,14 @@ class CustomOpenSandbox(BaseSandbox):
                     info.size = len(content)
                     tar.addfile(info, io.BytesIO(content))
                 tar_stream.seek(0)
+                payload = tar_stream.read()
 
-                self._container.put_archive(dir_name, tar_stream.read())
+                try:
+                    self._container.put_archive(dir_name, payload)
+                except Exception as exc:
+                    if not _is_read_only_refusal(exc):
+                        raise
+                    self._extract_via_exec(dir_name, payload)
                 results.append(FileUploadResponse(path=path, error=None))
             except Exception as e:
                 results.append(FileUploadResponse(path=path, error=str(e)))
@@ -404,7 +449,13 @@ class CustomOpenSandbox(BaseSandbox):
 
         try:
             self.execute(f"mkdir -p '{remote_dir}'")
-            self._container.put_archive(remote_dir, tar_stream.read())
+            payload = tar_stream.read()
+            try:
+                self._container.put_archive(remote_dir, payload)
+            except Exception as exc:
+                if not _is_read_only_refusal(exc):
+                    raise
+                self._extract_via_exec(remote_dir, payload)
             return f"OK: uploaded {local_dir} -> {remote_dir}"
         except Exception as e:
             return f"Upload directory failed: {e}"

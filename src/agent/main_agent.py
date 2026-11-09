@@ -102,7 +102,11 @@ def _upload_project_to_sandbox(sandbox) -> bool:
         )
         return True
     except Exception as e:
-        agent_logger.warning(f"Project upload to sandbox failed (non-fatal): {e}")
+        # 这是安全降级，不是可以忽略的小问题：接下来 Agent 写的代码会在宿主机上跑。
+        agent_logger.error(
+            f"Sandbox project bootstrap failed ({e}); agent code will execute on the HOST "
+            f"via LocalShellBackend until this is fixed"
+        )
         return False
 
 
@@ -238,8 +242,11 @@ def create_main_agent(
             f"{sandbox_backend.container_name}"
         )
     except Exception as e:
-        agent_logger.warning(
-            f"Managed Docker sandbox unavailable ({e}), falling back to LocalShell"
+        # 降级到 LocalShell 意味着 Agent 的任何命令都直接跑在宿主机上，
+        # 与「7 层沙箱」的安全承诺相反，所以用 ERROR 级别让它不可错过。
+        agent_logger.error(
+            f"Managed Docker sandbox unavailable ({e}), falling back to LocalShell "
+            f"(agent commands will run on the HOST)"
         )
         sandbox_backend = LocalShellBackend(virtual_mode=True)
         from .backends.sandbox_holder import set_sandbox

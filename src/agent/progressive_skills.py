@@ -230,8 +230,13 @@ class SkillCatalog:
             try:
                 return json.dumps({"success": True, **fn(**kwargs)}, ensure_ascii=False)
             except Exception as exc:
-                # Do not expose storage errors, file contents or credentials.
-                return json.dumps({"success": False, "error": f"Skill read unavailable ({type(exc).__name__}); check ID, path and file limits."})
+                # Do not expose storage errors, file contents or credentials, but do
+                # keep validation messages: hiding them left the model guessing at
+                # "Skill read unavailable (ValueError)" when the real cause was a
+                # pagination bound rather than a broken skill.
+                detail = str(exc) if isinstance(exc, (ValueError, KeyError)) and str(exc) else ""
+                suffix = f"{detail}; check ID, path and file limits." if detail else "check ID, path and file limits."
+                return json.dumps({"success": False, "error": f"Skill read unavailable ({type(exc).__name__}): {suffix}"})
 
         @tool
         def list_skills(query: str = "", offset: int = 0, limit: int = 20) -> str:
