@@ -215,6 +215,27 @@ class SandboxManager:
         finally:
             client.close()
 
+    @staticmethod
+    def _is_orphan(name: str, known: set, protected: set) -> bool:
+        """判定容器是否为孤儿（可安全删除）。
+
+        三个条件全部满足才算孤儿，任一条不满足都必须保留：
+
+        - 名字带 ``erp-sandbox-`` 前缀：避免误删同宿主上的其他容器；
+        - 不在 ``known``（本进程内存登记表）里：在表里的容器正在被使用；
+        - 不在 ``protected``（MongoDB ``sandbox_cache`` 登记的名字）里：
+          这些容器跨进程仍可被 ``_restore_from_mongodb`` 恢复成用户沙箱。
+
+        抽成纯函数是为了能离线覆盖判定逻辑——这里判错会删掉用户的活容器。
+        """
+        if not name or not name.startswith(SANDBOX_CONTAINER_PREFIX):
+            return False
+        # 名字恰好等于前缀：旧版 README 教用户手工 `docker run --name erp-sandbox`
+        # 建的就是这个名字，代码从不产生它，保守保留。
+        if name == SANDBOX_CONTAINER_PREFIX:
+            return False
+        return name not in known and name not in protected
+
     def _reclaim_orphan_containers(self) -> int:
         """回收上次进程遗留的沙箱容器。
 
@@ -242,11 +263,7 @@ class SandboxManager:
                     known = set(self._entries.keys())
                 for container in containers:
                     name = container.name or ""
-                    if (
-                        not name.startswith(SANDBOX_CONTAINER_PREFIX)
-                        or name in known
-                        or name in protected
-                    ):
+                    if not self._is_orphan(name, known, protected):
                         continue
                     try:
                         container.stop(timeout=2)
