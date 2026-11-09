@@ -20,11 +20,13 @@
 - 健康检查 + 自动重建故障容器
 - 超时回收闲置沙箱（默认 30 分钟）
 """
+import os
+import socket
 import time
 import threading
 import uuid
 from typing import Dict, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from .custom_opensandbox import CustomOpenSandbox
 from .sandbox_setup import SandboxConfig, create_secure_sandbox
@@ -39,6 +41,66 @@ from ..observability import measured
 
 # 容器名统一前缀：预热池 erp-sandbox-warm-*，用户沙箱 erp-sandbox-<user>-*
 SANDBOX_CONTAINER_PREFIX = "erp-sandbox-"
+
+# 容器存活登记表：名字 → {host, pid, updated_at}。
+# 内存登记表只对本进程可见，跨进程判定“这个容器是否被别的活进程持有”
+# 只能靠外部共享状态，否则第二个进程启动就会删掉活进程的容器。
+SANDBOX_REGISTRY_COLLECTION = "sandbox_registry"
+
+# 心跳保鲜期：超过这个时间没有刷新的登记视为陈旧（另一台机器上可能已崩）。
+SANDBOX_REGISTRY_TTL_SECONDS = max(60, SANDBOX_IDLE_TIMEOUT_MINUTES * 2) * 60
+
+# 没有任何登记记录的容器，只有在“足够老”时才敢当孤儿删掉。
+# 这个窗口容忍「旧版本进程创建的容器」与「登记写入失败」。
+SANDBOX_ORPHAN_MIN_AGE_SECONDS = (
+    int(os.getenv("SANDBOX_ORPHAN_MIN_AGE_MINUTES", "120")) * 60
+)
+
+# 本进程所在机器（用于区分“同一个 pid 号”是否指同一个进程）
+SANDBOX_HOST = socket.gethostname()
+
+
+def _pid_alive(pid: int) -> bool:
+    """pid 对应的进程是否还活着（标准库实现，不引入 psutil）。
+
+    注意 Windows 上不能用 ``os.kill(pid, 0)`` 探测：它在本平台是
+    TerminateProcess（直接杀进程）。这里改用 ``OpenProcess(SYNCHRONIZE)``
+    + ``WaitForSingleObject(0)``。
+
+    pid 会被系统复用，所以调用方必须同时校验 host；“同机 + pid 活”
+    只是“很可能就是当初那个进程”，而滥用这个判定的代价是误删用户容器，
+    所以调用方还叠了心跳时间窗口作为第二道保险。
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+
+    if os.name == "nt":
+        import ctypes
+
+        SYNCHRONIZE = 0x00100000
+        WAIT_TIMEOUT = 0x00000102
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+        if not handle:
+            return False  # 进程不存在，或没权限（后者几乎不可能）
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+        finally:
+            kernel32.CloseHandle(handle)
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # 存在但属于其他用户
+    except OSError:
+        return False
+    return True
 
 class SandboxState:
     WARM = "warm"           # 预热池中的空闲容器
@@ -162,6 +224,7 @@ class SandboxManager:
     def ensure_warm_pool(self):
         """确保预热池中有足够的空闲容器"""
         self._reclaim_orphan_containers_once()
+        self._touch_registry()  # 心跳：让别的进程知道这些容器有人用
         with self._lock:
             warm_count = sum(
                 1 for e in self._entries.values()
@@ -236,15 +299,168 @@ class SandboxManager:
             return False
         return name not in known and name not in protected
 
+    @staticmethod
+    def _should_reclaim(
+        name: str,
+        *,
+        known: set,
+        protected: set,
+        doc: Optional[dict],
+        age_seconds: Optional[float],
+        host: str,
+        is_pid_alive,
+        now: datetime,
+        fresh_seconds: Optional[int] = None,
+        min_age_seconds: Optional[int] = None,
+    ) -> bool:
+        """结合存活登记表判定是否该回收（纯函数，完全可离线覆盖）。
+
+        判定顺序与理由：
+
+        1. 前缀 / 内存登记 / Mongo 缓存 —— 复用 ``_is_orphan``；
+        2. 有登记且同 host：pid 活 ⇒ 别的活进程持有 ⇒ 保留；pid 死 ⇒ 孤儿；
+        3. 有登记但不同 host：看不见对方 pid，只能靠心跳；陈旧的才算孤儿；
+        4. 无登记：不知道谁建的，只有“足够老”才当孤儿删（容忍登记写入失败
+           与旧版本进程留下的容器）。
+
+        所有“拿不准”的分支一律返回 False——宁可漏清，不可错删。
+        """
+        if not SandboxManager._is_orphan(name, known, protected):
+            return False
+
+        fresh_seconds = (
+            SANDBOX_REGISTRY_TTL_SECONDS if fresh_seconds is None else fresh_seconds
+        )
+        min_age_seconds = (
+            SANDBOX_ORPHAN_MIN_AGE_SECONDS
+            if min_age_seconds is None
+            else min_age_seconds
+        )
+
+        if doc:
+            if doc.get("host") == host:
+                return not is_pid_alive(doc.get("pid") or 0)
+            updated = doc.get("updated_at")
+            if not isinstance(updated, datetime):
+                return False  # 登记字段坏了，宁可保留
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=timezone.utc)
+            return (now - updated).total_seconds() > fresh_seconds
+
+        if age_seconds is None:
+            return False
+        return age_seconds > min_age_seconds
+
+    # -------------------- 存活登记表（MongoDB） --------------------
+
+    def _registry_collection(self):
+        """返回 (client, sandbox_registry 集合)；由调用方关闭 client。"""
+        from pymongo import MongoClient
+
+        mongo_uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+        db_name = os.getenv("MONGODB_DB_NAME", "erp_agent")
+        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=3000)
+        return client, client[db_name][SANDBOX_REGISTRY_COLLECTION]
+
+    def _register_container(self, container_name: str) -> None:
+        """登记录当前进程持有该容器（失败只告警，不影响主流程）。"""
+        try:
+            client, coll = self._registry_collection()
+            try:
+                now = datetime.now(timezone.utc)
+                coll.update_one(
+                    {"container_name": container_name},
+                    {
+                        "$set": {
+                            "host": SANDBOX_HOST,
+                            "pid": os.getpid(),
+                            "updated_at": now,
+                        },
+                        "$setOnInsert": {"created_at": now},
+                    },
+                    upsert=True,
+                )
+            finally:
+                client.close()
+        except Exception as e:
+            sandbox_logger.warning(
+                f"Failed to register sandbox {container_name}: {e}"
+            )
+
+    def _unregister_container(self, container_name: str) -> None:
+        try:
+            client, coll = self._registry_collection()
+            try:
+                coll.delete_one({"container_name": container_name})
+            finally:
+                client.close()
+        except Exception as e:
+            sandbox_logger.warning(
+                f"Failed to unregister sandbox {container_name}: {e}"
+            )
+
+    def _touch_registry(self) -> None:
+        """心跳：把本进程所有容器的 updated_at 刷新到现在。"""
+        with self._lock:
+            names = list(self._entries.keys())
+        if not names:
+            return
+        try:
+            client, coll = self._registry_collection()
+            try:
+                coll.update_many(
+                    {"container_name": {"$in": names}},
+                    {
+                        "$set": {
+                            "host": SANDBOX_HOST,
+                            "pid": os.getpid(),
+                            "updated_at": datetime.now(timezone.utc),
+                        }
+                    },
+                )
+            finally:
+                client.close()
+        except Exception as e:
+            sandbox_logger.warning(f"Failed to refresh sandbox registry: {e}")
+
+    def _registry_docs(self) -> Dict[str, dict]:
+        """读取整张登记表：容器名 → 登记文档。"""
+        client, coll = self._registry_collection()
+        try:
+            return {
+                d["container_name"]: d
+                for d in coll.find({})
+                if d.get("container_name")
+            }
+        finally:
+            client.close()
+
+    @staticmethod
+    def _container_age_seconds(attrs: Optional[dict]) -> Optional[float]:
+        """从 docker inspect 的 attrs 解析容器年龄（秒）。"""
+        created = (attrs or {}).get("Created")
+        if not created:
+            return None
+        try:
+            ts = datetime.fromisoformat(str(created).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - ts).total_seconds()
+
     def _reclaim_orphan_containers(self) -> int:
         """回收上次进程遗留的沙箱容器。
 
         容器登记表只在本进程内存（``self._entries``）里，后端重启后旧容器
         无人认领，会一直占着内存和 CPU（历史上每次重启漏一个）。
-        启动时按容器名前缀扫一遍 Docker，既不在内存登记表、也没在 MongoDB
-        缓存里的容器视为孤儿并清掉；MongoDB 读不到时整步跳过，宁可漏清不可错删。
+
+        但“本进程内存里没有”远不等于“没人用”：预热池与活进程持有的容器
+        都不在内存以外任何地方，只看内存会把别的活进程的容器当孤儿删掉。
+        所以这里叠三道保护：内存登记表、MongoDB ``sandbox_cache``（可恢复
+        的用户沙箱）、MongoDB ``sandbox_registry``（每个容器一行心跳，带
+        host + pid）。任何一道读不到就整步跳过：宁可漏清，不可错删。
         """
-        reclaimed = 0
         try:
             protected = self._cached_container_names()
         except Exception as e:
@@ -252,6 +468,15 @@ class SandboxManager:
                 f"Orphan sandbox reclamation skipped (MongoDB cache unavailable): {e}"
             )
             return 0
+        try:
+            registry = self._registry_docs()
+        except Exception as e:
+            sandbox_logger.warning(
+                f"Orphan sandbox reclamation skipped (registry unavailable): {e}"
+            )
+            return 0
+
+        reclaimed = 0
         try:
             import docker
             client = docker.from_env()
@@ -261,9 +486,21 @@ class SandboxManager:
                 )
                 with self._lock:
                     known = set(self._entries.keys())
+                now = datetime.now(timezone.utc)
                 for container in containers:
                     name = container.name or ""
-                    if not self._is_orphan(name, known, protected):
+                    if not self._should_reclaim(
+                        name,
+                        known=known,
+                        protected=protected,
+                        doc=registry.get(name),
+                        age_seconds=self._container_age_seconds(
+                            getattr(container, "attrs", None)
+                        ),
+                        host=SANDBOX_HOST,
+                        is_pid_alive=_pid_alive,
+                        now=now,
+                    ):
                         continue
                     try:
                         container.stop(timeout=2)
@@ -271,6 +508,7 @@ class SandboxManager:
                         pass
                     try:
                         container.remove(force=True)
+                        self._unregister_container(name)
                         reclaimed += 1
                         sandbox_logger.info(f"Removed orphan sandbox container: {name}")
                     except Exception as e:
@@ -300,6 +538,8 @@ class SandboxManager:
             "mkdir -p /workspace /workspace/data /workspace/analysis "
             "/workspace/output /skills"
         )
+        # 登记存活心跳：否则别的进程启动时会把它当成孤儿删掉
+        self._register_container(name)
 
         return SandboxEntry(sandbox=sandbox, state=SandboxState.WARM)
 
@@ -405,6 +645,7 @@ class SandboxManager:
             state=SandboxState.CLAIMED,
         )
         entry.claimed_at = datetime.now()
+        self._register_container(name)
 
         raced_entry = None
         with self._lock:
@@ -495,6 +736,10 @@ class SandboxManager:
                         self._entries[container_name] = entry
                         self._user_map[user_id] = container_name
 
+                    # 认领回本进程：更新登记表里的 host/pid，否则旧 pid 已死，
+                    # 别的进程会把这个正在用的容器当孤儿删掉。
+                    self._register_container(container_name)
+
                     sandbox_logger.info(
                         f"Restored sandbox from MongoDB cache: {container_name}"
                     )
@@ -573,6 +818,7 @@ class SandboxManager:
                     entry.sandbox.destroy_container()
                 except Exception:
                     pass
+                self._unregister_container(entry.container_name)
             self._entries.clear()
             self._user_map.clear()
         sandbox_logger.info("All sandboxes destroyed")
@@ -674,6 +920,7 @@ class SandboxManager:
         self._entries.pop(entry.container_name, None)
         if entry.user_id:
             self._user_map.pop(entry.user_id, None)
+        self._unregister_container(entry.container_name)
 
 
 # ============================================================

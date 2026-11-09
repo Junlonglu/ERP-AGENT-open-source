@@ -226,6 +226,20 @@ python -m unittest src.test.test_hybrid_review -v
   新建(CREATE) ←────────────── 销毁(DESTROY)
 ```
 
+启动时会回收上一个进程遗留的孤儿容器（历史上每次重启漏一个）。判定不只
+看本进程内存——内存表对别的进程不可见，只看它会把**活进程正在用的容器**
+当成孤儿删掉。因此有两道外部状态：
+
+| 集合 | 写入时机 | 作用 |
+|---|---|---|
+| `sandbox_cache` | 容器被用户认领 | 重启后可按 user→container 恢复 |
+| `sandbox_registry` | 容器创建时；`ensure_warm_pool` 每次调用刷新 | 心跳：`host` + `pid` + `updated_at` |
+
+回收规则（`SandboxManager._should_reclaim`，纯函数、离线可测）：同机且登记的
+pid 存活 ⇒ 保留；同机且 pid 已死 ⇒ 回收；异机看心跳新鲜度；无登记则要求容器
+足够老。任何一处「拿不准」都保留——宁可漏清，不可错删。MongoDB 任一集合读到不
+就整步跳过。
+
 ### 4. HITL 人工审批
 - 订单创建/更新触发 `interrupt_on` 中断
 - 前端展示审批卡片，用户批准后恢复执行
