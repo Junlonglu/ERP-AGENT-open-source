@@ -26,11 +26,30 @@ SDK异步批量发送，网络失败不作为业务失败；退出最多等待3�
 
 认领埋点是一次尝试成功返回，不等于命中预热池；健康埋点可能包含节流跳过，不代表每次实际ping。恢复成功不证明所有依赖安装均成功。单独的记忆检索命中数、审批等待跨Trace时长和依赖恢复明细尚未覆盖，不能据现有事件推断这些指标。
 
+## 失败可见性
+
+遥测失败一律不向上抛——埋点不能拖垮请求。但「吞掉」不等于「不报」，否则升级一次 langfuse 就会变成零 span 且日志无一行：本模块曾因 `from langfuse import propagate_attributes` 不兼容而静默降级，排查花了半小时。
+
+现在每个吞掉异常的位置都登记一个站点名，第一次失败按 WARNING 打完整 traceback，重复失败只累加计数，`shutdown` 时汇总一行：
+
+| 站点 | 含义 | 常见原因 |
+|---|---|---|
+| `langfuse.config` | 开了开关但缺凭据 | 只填了部分 `LANGFUSE_*` |
+| `langfuse.client` | 客户端构造失败 | 未安装 langfuse、构造参数不兼容 |
+| `langfuse.root_span` | 根 span 建不出来 | SDK 缺少 `propagate_attributes`（版本过旧或过新） |
+| `langfuse.span_start` / `span_end` | 子 span 建立或收尾失败 | SDK API 变更 |
+| `langfuse.event` / `finish` | 事件与结束写入失败 | 同上 |
+| `langfuse.flush` | 退出前 flush 失败 | 网络不可达、超时 |
+
+判定顺序里没有「环境变量齐全且 SDK 可用」之外的硬前置：日志出现 `observability suppressed ...` 就是链路真的断了，不必再猜。`observability.suppressed_errors()` 返回各站点计数，可直接在 Python 里查。
+
+开发测试：`python scripts/dev.py test src/test/test_observability.py src/test/test_observability_errors.py`。
+
 ## 评测报告导入
 
 `python -m evals.upload_langfuse --suite business` 默认只读预览36条；`--suite routing` 预览 800 条路由合成样本的评测记录。确认后加 `--send` 上传。上传仅固定历史报告的指标和分数，不伪装新执行，不发送正文。重复运行会创建新的导入，比较时按batch、split和provider筛选。
 
-本版优先实现元数据和评分；合成正文上传暂不开放，以避免误把文件路径中的业务内容当成测试资料。开发测试：`python -m unittest src.test.test_observability -q`。
+本版优先实现元数据和评分；合成正文上传暂不开放，以避免误把文件路径中的业务内容当成测试资料。
 
 ## 验收
 

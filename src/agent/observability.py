@@ -10,15 +10,61 @@ import time
 from contextvars import ContextVar
 from langchain_core.callbacks import BaseCallbackHandler
 
+from .log_utils import get_logger
+
 _current = ContextVar('erp_trace', default=None)
 _client = None
 _client_lock = threading.Lock()
+_logger = get_logger('observability')
+_suppressed = {}
+_suppressed_lock = threading.Lock()
+
+
+def _suppressed_error(site, error):
+    """Record a tracing failure that was deliberately not propagated.
+
+    Tracing must never break a request, so every failure below is swallowed -- but
+    swallowing them silently is how a langfuse upgrade once turned this module into
+    zero spans with no signal. The first failure per site is logged with its
+    traceback; repeats are only counted and summarised at shutdown.
+    """
+    with _suppressed_lock:
+        count = _suppressed.get(site, 0) + 1
+        _suppressed[site] = count
+    if count == 1:
+        try:
+            _logger.warning('observability suppressed %s at %s', type(error).__name__, site, exc_info=error)
+        except Exception:
+            pass
+
+
+def suppressed_errors():
+    """Per-site counts of swallowed tracing failures (diagnostics and tests)."""
+    with _suppressed_lock:
+        return dict(_suppressed)
+
+
+def _report_suppressed():
+    with _suppressed_lock:
+        counts = dict(_suppressed)
+    if not counts:
+        return
+    try:
+        _logger.warning('observability suppressed %d tracing error(s) across %d site(s): %s',
+                        sum(counts.values()), len(counts),
+                        ', '.join('%s=%d' % (site, count) for site, count in sorted(counts.items())))
+    except Exception:
+        pass
 
 
 def client():
     global _client
     if os.getenv('ERP_LANGFUSE_ENABLED', 'false').lower() != 'true': return None
-    if not all(os.getenv(k) for k in ('LANGFUSE_SECRET_KEY', 'LANGFUSE_PUBLIC_KEY', 'LANGFUSE_BASE_URL', 'ERP_TRACE_HASH_KEY')): return None
+    required = ('LANGFUSE_SECRET_KEY', 'LANGFUSE_PUBLIC_KEY', 'LANGFUSE_BASE_URL', 'ERP_TRACE_HASH_KEY')
+    missing = [key for key in required if not os.getenv(key)]
+    if missing:
+        _suppressed_error('langfuse.config', LookupError('ERP_LANGFUSE_ENABLED=true but missing: ' + ', '.join(missing)))
+        return None
     with _client_lock:
         if _client is None:
             try:
@@ -30,7 +76,9 @@ def client():
                 _client = Langfuse(timeout=10, flush_at=20, flush_interval=5,
                     environment=os.getenv('ERP_TRACE_ENVIRONMENT','development'),
                     release=os.getenv('ERP_TRACE_RELEASE','unversioned'))
-            except Exception: return None
+            except Exception as error:
+                _suppressed_error('langfuse.client', error)
+                return None
     return _client
 
 
@@ -51,7 +99,9 @@ class Trace:
                 with propagate_attributes(**identity):
                     self.root = self.client.start_observation(name='erp.request', as_type='span')
                 self.root.update(metadata={**identity,'resume': bool(resume), 'content_policy': 'metadata_only'})
-            except Exception: self.root = None
+            except Exception as error:
+                self.root = None
+                _suppressed_error('langfuse.root_span', error)
         self.callback = MetadataCallback(self)
 
     def start(self, name, parent=None, generation=False):
@@ -59,7 +109,9 @@ class Trace:
         try:
             return self.client.start_observation(name=name, as_type='generation' if generation else 'span',
                 trace_context={'trace_id': self.root.trace_id, 'parent_span_id': (parent or self.root).id})
-        except Exception: return None
+        except Exception as error:
+            _suppressed_error('langfuse.span_start', error)
+            return None
 
     def event(self, name, **numbers):
         span = self.start(name)
@@ -67,7 +119,7 @@ class Trace:
             try:
                 span.update(metadata={k:v for k,v in numbers.items() if isinstance(v,(int,float,bool))})
                 span.end()
-            except Exception: pass
+            except Exception as error: _suppressed_error('langfuse.event', error)
 
     def finish(self, status):
         self.callback.close()
@@ -75,7 +127,7 @@ class Trace:
             try:
                 self.root.update(metadata={'status': status, 'duration_ms': (time.perf_counter()-self.started)*1000})
                 self.root.end()
-            except Exception: pass
+            except Exception as error: _suppressed_error('langfuse.finish', error)
 
 
 def event(name, **numbers):
@@ -116,7 +168,7 @@ class MetadataCallback(BaseCallbackHandler):
                     values['usage_details']={dest:int(usage[k]) for k,dest in [('input_tokens','input'),('output_tokens','output'),('total_tokens','total')] if isinstance(usage.get(k),int)}
                 if model and re.fullmatch(r'[a-zA-Z0-9._:/-]{1,80}',model): values['model']=model
                 span.update(**values);span.end()
-            except Exception: pass
+            except Exception as error: _suppressed_error('langfuse.span_end', error)
     def on_chain_start(self, serialized, inputs, *, run_id, parent_run_id=None, **kw):
         self.begin(run_id,parent_run_id,'agent.step')
     def on_chain_end(self, outputs, *, run_id, **kw): self.end(run_id)
@@ -189,4 +241,5 @@ def traced_config(config):
 async def shutdown():
     if _client:
         try: await asyncio.wait_for(asyncio.to_thread(_client.flush),3)
-        except Exception: pass
+        except Exception as error: _suppressed_error('langfuse.flush', error)
+    _report_suppressed()
