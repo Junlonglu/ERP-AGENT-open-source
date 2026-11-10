@@ -15,6 +15,7 @@ import threading
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 from src.agent.backends.sandbox_manager import (
     SANDBOX_CONTAINER_PREFIX,
@@ -329,6 +330,164 @@ def _current_pid():
     import os
 
     return os.getpid()
+
+
+class ClaimStalenessTests(unittest.TestCase):
+    """``_claim_is_stale``：已认领缓存的 TTL 判定。"""
+
+    TTL = timedelta(minutes=120)
+
+    def _stale(self, doc, registry_doc=None, *, alive=False, self_pid=None):
+        return SandboxManager._claim_is_stale(
+            doc,
+            registry_doc,
+            NOW,
+            self.TTL,
+            host=HOST,
+            is_pid_alive=lambda pid: alive,
+            self_pid=1234 if self_pid is None else self_pid,
+        )
+
+    def test_other_live_process_keeps_its_sandbox(self):
+        doc = {"last_active_at": (NOW - timedelta(days=30)).isoformat()}
+        self.assertFalse(self._stale(doc, {"host": HOST, "pid": 4321}, alive=True))
+
+    def test_dead_process_past_ttl_is_stale(self):
+        doc = {"last_active_at": (NOW - timedelta(minutes=121)).isoformat()}
+        self.assertTrue(self._stale(doc, {"host": HOST, "pid": 4321}))
+
+    def test_dead_process_within_ttl_is_kept(self):
+        doc = {"last_active_at": (NOW - timedelta(minutes=119)).isoformat()}
+        self.assertFalse(self._stale(doc, {"host": HOST, "pid": 4321}))
+
+    def test_own_pid_past_ttl_is_stale(self):
+        # 本进程已经不在内存表里（销毁/重建后遗留的缓存） → 可以回改
+        doc = {"last_active_at": (NOW - timedelta(days=2)).isoformat()}
+        self.assertTrue(self._stale(doc, {"host": HOST, "pid": 1234}, alive=True))
+
+    def test_foreign_host_relies_on_ttl(self):
+        doc = {"last_active_at": (NOW - timedelta(days=2)).isoformat()}
+        self.assertTrue(self._stale(doc, {"host": "other-host", "pid": 4321}, alive=True))
+
+    def test_falls_back_to_claimed_at_then_created_at(self):
+        old = (NOW - timedelta(days=2)).isoformat()
+        self.assertTrue(self._stale({"claimed_at": old}))
+        self.assertTrue(self._stale({"created_at": old}))
+
+    def test_datetime_values_are_accepted(self):
+        doc = {"last_active_at": datetime.now(timezone.utc) - timedelta(days=2)}
+        self.assertTrue(self._stale(doc))
+
+    def test_missing_or_broken_timestamps_are_kept(self):
+        for doc in ({}, {"last_active_at": None}, {"last_active_at": "not-a-date"}, {"claimed_at": 12345}):
+            with self.subTest(doc=doc):
+                self.assertFalse(self._stale(doc))
+
+
+class StaleClaimLoopTests(unittest.TestCase):
+    """跑真实回收循环（假 docker + 假 Mongo 文档），确认只删陈旧认领容器。"""
+
+    def _manager(self, cache_docs, registry=None):
+        manager = object.__new__(SandboxManager)
+        manager._entries = {}
+        manager._lock = threading.Lock()
+        manager._last_stale_claim_check = None
+        manager._cache_docs = lambda: list(cache_docs)
+        manager._registry_docs = lambda: dict(registry or {})
+        manager._unregistered = []
+        manager._unregister_container = manager._unregistered.append
+        manager._dropped_caches = []
+        manager._cleanup_mongodb_cache = manager._dropped_caches.append
+        return manager
+
+    def _install_fake_docker(self, existing):
+        removed = []
+
+        class _C:
+            def __init__(self, name):
+                self.name = name
+
+            def stop(self, timeout=0):
+                return None
+
+            def remove(self, force=False):
+                removed.append(self.name)
+
+        class _Containers:
+            def get(self, name):
+                if name not in existing:
+                    raise RuntimeError(f"no such container: {name}")
+                return _C(name)
+
+        class _Client:
+            containers = _Containers()
+
+            def close(self):
+                pass
+
+        sys.modules["docker"] = types.SimpleNamespace(from_env=lambda: _Client())
+        self.addCleanup(sys.modules.pop, "docker", None)
+        return removed
+
+    def test_reclaims_stale_claim_and_cache_row(self):
+        name = f"{PREFIX}warm-stale"
+        doc = {
+            "user_id": "gone-user",
+            "container_name": name,
+            "last_active_at": (datetime.now(timezone.utc) - timedelta(days=3)).isoformat(),
+        }
+        manager = self._manager([doc], {name: {"host": SANDBOX_HOST, "pid": 999999}})
+        removed = self._install_fake_docker(existing={name})
+
+        self.assertEqual(manager._reclaim_stale_claims(force=True), 1)
+        self.assertEqual(removed, [name])
+        self.assertEqual(manager._unregistered, [name])
+        self.assertEqual(manager._dropped_caches, ["gone-user"])
+
+    def test_keeps_container_held_by_live_process(self):
+        name = f"{PREFIX}warm-live"
+        doc = {
+            "user_id": "busy-user",
+            "container_name": name,
+            "last_active_at": (datetime.now(timezone.utc) - timedelta(days=30)).isoformat(),
+        }
+        manager = self._manager([doc], {name: {"host": SANDBOX_HOST, "pid": 4321}})
+        removed = self._install_fake_docker(existing={name})
+
+        # 另一个活进程持有这个容器：再旧也不能动
+        with patch("src.agent.backends.sandbox_manager._pid_alive", return_value=True):
+            self.assertEqual(manager._reclaim_stale_claims(force=True), 0)
+        self.assertEqual(removed, [])
+        self.assertEqual(manager._dropped_caches, [])
+
+    def test_missing_container_only_drops_cache(self):
+        name = f"{PREFIX}warm-ghost"
+        doc = {
+            "user_id": "ghost-user",
+            "container_name": name,
+            "last_active_at": (datetime.now(timezone.utc) - timedelta(days=9)).isoformat(),
+        }
+        manager = self._manager([doc], {})
+        removed = self._install_fake_docker(existing=set())
+
+        self.assertEqual(manager._reclaim_stale_claims(force=True), 0)
+        self.assertEqual(removed, [])
+        self.assertEqual(manager._dropped_caches, ["ghost-user"])
+
+    def test_throttled_between_calls(self):
+        manager = self._manager([], {})
+        self._install_fake_docker(existing=set())
+        self.assertEqual(manager._reclaim_stale_claims(force=True), 0)
+        manager._cache_docs = lambda: (_ for _ in ()).throw(AssertionError("不应再次查 Mongo"))
+        self.assertEqual(manager._reclaim_stale_claims(), 0)
+
+    def test_mongo_unavailable_touches_nothing(self):
+        manager = self._manager([], {})
+        manager._cache_docs = lambda: (_ for _ in ()).throw(RuntimeError("mongo down"))
+        removed = self._install_fake_docker(existing={f"{PREFIX}warm-x"})
+
+        self.assertEqual(manager._reclaim_stale_claims(force=True), 0)
+        self.assertEqual(removed, [])
 
 
 if __name__ == "__main__":

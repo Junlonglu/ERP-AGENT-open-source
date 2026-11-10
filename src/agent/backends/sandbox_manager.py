@@ -30,7 +30,11 @@ from datetime import datetime, timedelta, timezone
 
 from .custom_opensandbox import CustomOpenSandbox
 from .sandbox_setup import SandboxConfig, create_secure_sandbox
-from ..config import SANDBOX_IDLE_TIMEOUT_MINUTES, SANDBOX_WARM_POOL_SIZE
+from ..config import (
+    SANDBOX_CLAIM_TTL_MINUTES,
+    SANDBOX_IDLE_TIMEOUT_MINUTES,
+    SANDBOX_WARM_POOL_SIZE,
+)
 from ..log_utils import sandbox_logger
 from ..observability import measured
 
@@ -49,6 +53,8 @@ SANDBOX_REGISTRY_COLLECTION = "sandbox_registry"
 
 # 心跳保鲜期：超过这个时间没有刷新的登记视为陈旧（另一台机器上可能已崩）。
 SANDBOX_REGISTRY_TTL_SECONDS = max(60, SANDBOX_IDLE_TIMEOUT_MINUTES * 2) * 60
+# 陈旧认领检查很便宜（一次 Mongo 查询 + 一次 docker list），但没必要每分钟做
+SANDBOX_STALE_CLAIM_CHECK_SECONDS = 600
 
 # 没有任何登记记录的容器，只有在“足够老”时才敢当孤儿删掉。
 # 这个窗口容忍「旧版本进程创建的容器」与「登记写入失败」。
@@ -199,6 +205,7 @@ class SandboxManager:
         self._user_map: Dict[str, str] = {}           # user_id → container_name
         self._warm_creating = 0                        # 避免并发补池超量创建
         self._orphans_reclaimed = False                # 启动时只扫一次遗留容器
+        self._last_stale_claim_check: Optional[datetime] = None
 
         # --- 配置 ---
         self._warm_pool_size = (
@@ -260,6 +267,20 @@ class SandboxManager:
                 return
             self._orphans_reclaimed = True
         self._reclaim_orphan_containers()
+        self._reclaim_stale_claims()
+
+    def _cache_docs(self) -> list:
+        """``sandbox_cache`` 全量文档（认领过的用户沙箱）。"""
+        from pymongo import MongoClient
+        import os
+
+        mongo_uri = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+        db_name = os.getenv("MONGODB_DB_NAME", "erp_agent")
+        client = MongoClient(mongo_uri, serverSelectionTimeoutMS=3000)
+        try:
+            return list(client[db_name].sandbox_cache.find({}))
+        finally:
+            client.close()
 
     def _cached_container_names(self) -> set:
         """MongoDB 里登记过的容器名。
@@ -522,6 +543,140 @@ class SandboxManager:
         if reclaimed:
             sandbox_logger.info(
                 f"Reclaimed {reclaimed} orphan sandbox container(s) on startup"
+            )
+        return reclaimed
+
+    @staticmethod
+    def _doc_time(value) -> Optional[datetime]:
+        """把 Mongo 里的时间字段解析成带时区的 datetime（拿不准返回 None）。"""
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if isinstance(value, str) and value:
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        return None
+
+    @staticmethod
+    def _claim_is_stale(
+        doc: dict,
+        registry_doc: Optional[dict],
+        now: datetime,
+        ttl: timedelta,
+        *,
+        host: str = SANDBOX_HOST,
+        is_pid_alive=None,
+        self_pid: Optional[int] = None,
+    ) -> bool:
+        """已认领容器是否已经“陈旧”到可以回收（纯函数，可离线覆盖）。
+
+        两个条件决定保留：
+        1. 心跳指向**别的活进程**——那份 ``sandbox_cache`` 是它正在用的沙箱；
+        2. 拿不到时间戳——不知道多久没人用，就宁可留着。
+        """
+        registry_doc = registry_doc or {}
+        pid = registry_doc.get("pid")
+        self_pid = os.getpid() if self_pid is None else self_pid
+        is_pid_alive = _pid_alive if is_pid_alive is None else is_pid_alive
+        if (
+            registry_doc.get("host") == host
+            and pid
+            and pid != self_pid
+            and is_pid_alive(pid)
+        ):
+            return False
+        last_active = (
+            SandboxManager._doc_time(doc.get("last_active_at"))
+            or SandboxManager._doc_time(doc.get("claimed_at"))
+            or SandboxManager._doc_time(doc.get("created_at"))
+        )
+        if last_active is None:
+            return False
+        return (now - last_active) > ttl
+
+    def _reclaim_stale_claims(self, force: bool = False) -> int:
+        """回收「已被认领、但长期没人回来」的沙箱容器。
+
+        孤儿回收管不了它们：它们在 ``sandbox_cache`` 里（删了就丢用户文件），
+        所以 ``_is_orphan`` 永远返回 False；而 ``cleanup_idle_sandboxes`` 只遍历
+        本进程内存，重启后这些容器已经不在表里，于是两边都不管——
+        每换一个用户、每重启一次就永久漏一个。
+
+        这里的口径是：心跳指向的进程已死（或就是本进程且已不在内存），
+        并且 ``last_active_at`` 超过 ``SANDBOX_CLAIM_TTL_MINUTES``，才连容器带
+        缓存一起回收。容器已经不在了就只清缓存。
+        """
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            if not force and self._last_stale_claim_check is not None:
+                elapsed = (now - self._last_stale_claim_check).total_seconds()
+                if elapsed < SANDBOX_STALE_CLAIM_CHECK_SECONDS:
+                    return 0
+            self._last_stale_claim_check = now
+
+        try:
+            cache_docs = self._cache_docs()
+            registry = self._registry_docs()
+        except Exception as e:
+            sandbox_logger.warning(
+                f"Stale claim reclamation skipped (MongoDB unavailable): {e}"
+            )
+            return 0
+
+        ttl = timedelta(minutes=SANDBOX_CLAIM_TTL_MINUTES)
+        with self._lock:
+            known = set(self._entries.keys())
+
+        reclaimed = 0
+        try:
+            import docker
+            client = docker.from_env()
+            try:
+                for doc in cache_docs:
+                    doc = doc or {}
+                    name = doc.get("container_name") or ""
+                    user_id = doc.get("user_id") or ""
+                    if not name.startswith(SANDBOX_CONTAINER_PREFIX) or name in known:
+                        continue
+                    if not self._claim_is_stale(
+                        doc, registry.get(name), now, ttl, self_pid=os.getpid()
+                    ):
+                        continue
+                    try:
+                        container = client.containers.get(name)
+                    except Exception:
+                        self._cleanup_mongodb_cache(user_id)
+                        sandbox_logger.info(
+                            f"Dropped stale sandbox cache for missing container: {name}"
+                        )
+                        continue
+                    try:
+                        container.stop(timeout=2)
+                    except Exception:
+                        pass
+                    try:
+                        container.remove(force=True)
+                    except Exception as e:
+                        sandbox_logger.warning(
+                            f"Failed to remove stale claimed sandbox {name}: {e}"
+                        )
+                        continue
+                    self._unregister_container(name)
+                    self._cleanup_mongodb_cache(user_id)
+                    reclaimed += 1
+                    sandbox_logger.info(
+                        f"Reclaimed stale claimed sandbox: {name} (user={user_id}, "
+                        f"ttl={SANDBOX_CLAIM_TTL_MINUTES}min)"
+                    )
+            finally:
+                client.close()
+        except Exception as e:
+            sandbox_logger.warning(f"Stale claim reclamation skipped: {e}")
+        if reclaimed:
+            sandbox_logger.info(
+                f"Reclaimed {reclaimed} stale claimed sandbox container(s)"
             )
         return reclaimed
 
@@ -846,6 +1001,8 @@ class SandboxManager:
                         if user_id:
                             self._user_map.pop(user_id, None)
                             self._cleanup_mongodb_cache(user_id)
+        # 内存表的回收管不到“重启前就已认领”的容器，单独按 TTL 扫一遍。
+        self._reclaim_stale_claims()
 
     # ============================================================
     # 健康检查

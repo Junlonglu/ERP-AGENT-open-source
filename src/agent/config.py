@@ -77,6 +77,10 @@ SANDBOX_SKILLS_DIR = "/skills"
 SANDBOX_MEMORIES_DIR = "/memories"
 SANDBOX_WARM_POOL_SIZE = get_env_int("SANDBOX_WARM_POOL_SIZE", 1)
 SANDBOX_IDLE_TIMEOUT_MINUTES = get_env_int("SANDBOX_IDLE_TIMEOUT_MINUTES", 30)
+# 已认领容器跨进程保留多久。sandbox_cache 里的用户容器不会因为「本进程内存里
+# 没有」而被当孤儿删掉（删了就丢用户文件），所以必须有独立的 TTL：超过这个
+# 时长没人再来的认领容器，连同缓存一起回收。
+SANDBOX_CLAIM_TTL_MINUTES = get_env_int("SANDBOX_CLAIM_TTL_MINUTES", 720)
 SANDBOX_MAINTENANCE_INTERVAL_SECONDS = get_env_int(
     "SANDBOX_MAINTENANCE_INTERVAL_SECONDS", 60
 )
