@@ -9,6 +9,7 @@
     .venv/Scripts/python.exe scripts/dev.py lock       # 用 Docker 重新锁定依赖（pip-compile）
     .venv/Scripts/python.exe scripts/dev.py mcp        # 启动 MCP 服务 :9000
     .venv/Scripts/python.exe scripts/dev.py api        # 启动后端 API :8000
+    .venv/Scripts/python.exe scripts/dev.py mock-erp   # 启动 mock ERP :8081（无 Java 后端时用）
     .venv/Scripts/python.exe scripts/dev.py web        # 启动前端  :3000
     .venv/Scripts/python.exe scripts/dev.py lint       # ruff
     .venv/Scripts/python.exe scripts/dev.py test       # pytest
@@ -78,6 +79,10 @@ def main(argv: list[str]) -> int:
 
     if task == "api":
         return run([sys.executable, "-m", "src.api_view.web_main", *args])
+
+    if task == "mock-erp":
+        # 真 Java ERP 不在本仓库；没有它时 23 个 ERP 工具全部连接失败（见 scripts/mock_erp.py）。
+        return run([sys.executable, str(ROOT / "scripts" / "mock_erp.py"), *args])
 
     if task == "web":
         # 继承来的 PORT（例如被编辑器/工具链设成 8787）会覆盖 Next 默认端口

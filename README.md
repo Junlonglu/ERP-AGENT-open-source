@@ -405,7 +405,7 @@ ERP-AGENT/
 | MongoDB | 6.0+ | **必需** | 会话检查点（MongoDBSaver）与长期记忆（MongoDBStore）的唯一存储，连不上直接抛错，不会降级 |
 | DeepSeek API Key | — | **必需** | 主对话、grader、审查路由共用 |
 | Docker Desktop | 已启动 | 可选 | 缺失时自动回退到 `LocalShellBackend(virtual_mode=True)`，代码执行隔离性下降 |
-| Java ERP 后端 | `ERP_BASE_URL` 可达 | 可选 | 不可用时基础对话与联网搜索仍可启动，仅 ERP 工具调用失败 |
+| Java ERP 后端 | `ERP_BASE_URL` 可达 | 可选 | 不可用时基础对话与联网搜索仍可启动，仅 ERP 工具调用失败；没有 Java 后端时用 `python scripts/dev.py mock-erp` 起同构的 mock 版 |
 
 `.env` 中真正需要你填的只有 `DEEPSEEK_API_KEY` 一项（`MONGODB_URI` 默认就是 `mongodb://localhost:27017`，只有换地址时才需要改），其余在 `.env.example` 里都有可用默认值。缺少 `.env` 文件时启动会打印 `[warn] .env file not found at ...` 并继续。
 
@@ -457,7 +457,19 @@ docker run -d --name erp-mongodb -p 27017:27017 mongo:6.0
 # 或使用已有的 mongod 实例，改 MONGODB_URI 即可
 ```
 
-### 4. 准备 Docker 沙箱镜像（可选，无需手工建容器）
+### 4. 启动 Mock ERP（可选，没有 Java 后端时用）
+
+本仓库不含 Java ERP 后端。`scripts/mock_erp.py` 按 23 个工具实际调用的接口契约，实现了一份内存版 ERP（12 个零部件、12 条库存、6 张订单、5 个供应商，进程退出即重置）：
+
+```bash
+python scripts/dev.py mock-erp # Mock ERP :8081
+```
+
+`src/test/test_mock_erp.py` 会用 AST 从 `src/mcp_server/tools/*.py` 里抽出全部 `erp_client` 调用，反过来要求 mock 端一个不缺、一个不多——工具侧新增或改动了端点而 mock 没跟上时，CI 会直接红，而不是等 Agent 在对话里撞 404。
+
+对接真实 ERP 时把 `.env` 的 `ERP_BASE_URL` 指向真实地址、重启 MCP 即可，两者二选一。
+
+### 5. 准备 Docker 沙箱镜像（可选，无需手工建容器）
 
 沙箱容器由后端在启动时自动创建（预热池 + 按需认领，容器名形如 `erp-sandbox-warm-<hash>`），**不需要**手工 `docker run`。只需预先拉取镜像：
 
@@ -467,7 +479,7 @@ docker pull python:3.11-slim
 
 沙箱启用 7 层加固：只读根文件系统、tmpfs、资源限制、网络隔离、capability 移除、seccomp 白名单、PID 限制。自定义 seccomp 配置创建失败时会回退到基础沙箱，日志中会出现 seccomp 相关告警——这表示该轮隔离等级下降，不等于安全验收通过。
 
-### 5. 启动服务
+### 6. 启动服务
 
 三个服务各占一个终端：
 
@@ -497,7 +509,7 @@ Uvicorn running on http://0.0.0.0:8000
 ▲ Next.js 16.2.12  - Local: http://localhost:3000
 ```
 
-### 6. 访问与自检
+### 7. 访问与自检
 
 浏览器打开 http://localhost:3000
 
@@ -513,6 +525,8 @@ curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/api/history  # 20
 **启动报 `UnicodeEncodeError: 'gbk' codec can't encode character`**：`src/agent/env_utils.py` 的 `ensure_utf8_stdio()` 已统一处理（stdio 切 UTF-8，并把 Windows 控制台代码页设为 65001），无需再手工设置 `PYTHONIOENCODING`。若分支较旧没有该函数，启动前设置 `PYTHONIOENCODING=utf-8` 即可。
 
 **后端启动了但工具数量不对**：MCP Server 未就绪时，Agent 会重试 3 次后以空工具列表继续启动（日志有告警）。MCP 起来后重启后端即可重新加载 23 个 ERP 工具。
+
+**ERP 工具全部报 `All connection attempts failed`**：`:8081` 上没有 ERP 后端（真 Java 后端不在本仓库）。用 `python scripts/dev.py mock-erp` 起 mock 版，或把 `ERP_BASE_URL` 指向真实后端后重启 MCP——改地址后只需重启 MCP，后端在启动时缓存工具列表。
 
 **前端报 `Module not found: Can't resolve 'next/dist/...'`**：`node_modules` 完整性被破坏（多为并发执行 `npm install` 导致）。删掉 `frontend/node_modules` 后重新 `npm ci`。
 
